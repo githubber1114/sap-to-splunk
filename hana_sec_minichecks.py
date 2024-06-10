@@ -1,33 +1,83 @@
 from splunk_http_event_collector import http_event_collector
 from hdbcli import dbapi
-import boto3, json, time, sys, os, warnings
+import boto3, time, sys, os, warnings, logging, hashlib, random
 from datetime import datetime
-# import pandas as pd
 
 warnings.filterwarnings('ignore')
 
+def generate_uniqid():
+    # Generate a random number
+    random_num = str(random.randint(0, 99999999)).encode()
+
+    # Generate a SHA-256 hash of the random number.
+    hash_obj = hashlib.sha256(random_num)
+    hex_digit = hash_obj.hexdigest()
+
+    return hex_digit[:10]
+
+def log_to_splunk(testevent, metrics, hdbserver, SID, log, start_time=time.time()):
+    payload = {}
+    payload.update({"index" : "twdc_sap_hana"})
+    payload.update({"sourcetype" : "hana_sec_minichecks"})
+    payload.update({"source" : SID.upper()})
+    payload.update({"host" : hdbserver})
+    payload.update({"time": start_time})
+    payload.update({"event": metrics})
+    log.debug(f"payload is {payload}")
+    testevent.batchEvent(payload)
+
 def lambda_handler(event, context):
 
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} Starting HANA Security Minichecks script")
+    uniqid = generate_uniqid()
+
+    logging.basicConfig(format='%(asctime)s %(name)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S %z')
+    log = logging.getLogger(f'HSMC {uniqid}')
+    log.setLevel(logging.DEBUG)
+
     start_time = time.time()
     SID = event['SID'].lower()
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} Retrieving credentials from AWS Secrets Manager")
+    log.debug(f"Starting HANA Security Minichecks script")
+    log.debug(f"Retrieving credentials from AWS Secrets Manager for {SID.upper()}")
     client = boto3.client('secretsmanager')
     TokenResponse = client.get_secret_value(
         SecretId=f'/{SID}/hana/splunkmetrics'
     )
-    JsonSecret = json.loads(TokenResponse['SecretString'])
-    splunk_server = JsonSecret['splunk_server']
-    splunk_token = JsonSecret['splunk_token']
+    secret = eval(TokenResponse['SecretString'])
+    splunk_server = secret['splunk_server']             # Splunk server FQDN
+    splunk_token = secret['splunk_token']               # HEC Token
+    mmode = int(secret['hold'])                         # Maintenance Mode Flag
 
+    # Use Splunk QA (for testing purposes)
+    # splunk_server = 'hec-idx-us-east-1.qa.splunk.disney.com'                            # testing
+    # splunk_token = '52FF2510-F4FE-4B78-83AA-A244B8575134'
+
+    # Create event collector object, default SSL and HTTP Event Collector Port
+    testevent = http_event_collector(splunk_token, splunk_server)
+
+    # Log end of execution
+    status = {'EVENT_TYPE': 'HANA_SEC_MINICHECK', 'EVENT': 'START', 'UID': uniqid}
+    log_to_splunk(testevent, status, secret['hdbserver'], SID, log)
+
+    if mmode > 0:
+        log.debug(f"Maintenance Mode activated for {SID.upper()}; Quitting")
+        return
+    
     # Begin DB Connection
-    conn = dbapi.connect(
-        address = JsonSecret['hdbserver'],
-        port = JsonSecret['hdbport'],
-        user = JsonSecret['hdbuser'],
-        password = JsonSecret['hdbpass'],
-        encrypt='true'
-    )
+    try:
+        conn = dbapi.connect(
+            address = secret['hdbserver'],
+            port = secret['hdbport'],
+            user = secret['hdbuser'],
+            password = secret['hdbpass'],
+            encrypt='true'
+        )
+    except dbapi.Error as err:
+        log.critical(f"Failed to connect to {SID.upper()}; {err} Quitting")
+        status = {'EVENT_TYPE': 'HANA_SEC_MINICHECK', 'EVENT': 'ERROR', 'QUERY' : 'CONNECT', 'UID': uniqid, 'DETAIL': err}
+        log_to_splunk(testevent, status, secret['hdbserver'], SID, log)
+        testevent.flushBatch()
+        return
+    
     cursor = conn.cursor()
 
     # Open and read the file as a single buffer
@@ -37,34 +87,35 @@ def lambda_handler(event, context):
     sqlFile = fd.read()
     fd.close()
 
-    # Create event collector object, default SSL and HTTP Event Collector Port
-    testevent = http_event_collector(splunk_token, splunk_server)
-
     # perform a HEC reachable check
     hec_reachable = testevent.check_connectivity()
     if not hec_reachable:
-        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} HEC server {splunk_server} not reachable")
+        log.debug(f"HEC server {splunk_server} not reachable")
         sys.exit(1)
 
     # Set to pop null fields.  Always a good idea
     testevent.popNullFields = True
 
-    payload = {}
-    payload.update({"index" : "twdc_sap_hana"})
-    payload.update({"sourcetype" : "hana_sec_minichecks"})
-    payload.update({"source" : SID.upper()})
-    payload.update({"host" : JsonSecret['hdbserver']})
+    # payload = {}
+    # payload.update({"index" : "twdc_sap_hana"})
+    # payload.update({"sourcetype" : "hana_sec_minichecks"})
+    # payload.update({"source" : SID.upper()})
+    # payload.update({"host" : secret['hdbserver']})
 
     timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} Executing query to {SID}")
+    log.debug(f"Executing query to {SID}")
     prevchid = ""
     prevdesc = ""   
 
     try:
         cursor.execute(sqlFile)
         result = cursor.fetchall()
+        cursor.close()
+        conn.close()
     except dbapi.Error as err:
-        print ("HANA query was unsuccessful: ", err)
+        log.critical(f"HANA query to run security minicheck was unsuccessful: {err}")
+        status = {'EVENT_TYPE': 'HANA_SEC_MINICHECK', 'EVENT': 'ERROR', 'UID': uniqid, 'QUERY' : sqlFile, 'DETAIL': err}
+        log_to_splunk(testevent, status, secret['hdbserver'], SID, log)
     i=0
     for row in result:
         metrics = {}
@@ -73,6 +124,8 @@ def lambda_handler(event, context):
         metrics['VALUE']=row[2]
         metrics['EXPECTED_VALUE']=row[3]
         metrics['C']=row[4]
+        if metrics['C'] == "":
+            metrics['C'] = " "
         metrics['SAP_NOTE']=row[5]
         metrics['SID'] = SID.upper()
         metrics['EVENT_TYPE'] = "HANA_SEC_MINICHECK"
@@ -87,17 +140,18 @@ def lambda_handler(event, context):
             elif "S" in prevchid:
                 metrics['CHID'] = prevchid
                 metrics['DESCRIPTION'] = prevdesc
-        if metrics['C'] == "":
-            metrics['C'] = " "
-        payload.update({"event":metrics})
-        testevent.batchEvent(payload)
+        metrics['UID'] = uniqid
+        log_to_splunk(testevent, metrics, secret['hdbserver'], SID, log, start_time)
         i=i+1
         
+    # Log end of execution
+    status = {'EVENT_TYPE': 'HANA_SEC_MINICHECK', 'EVENT': 'END', 'UID': uniqid}
+    log_to_splunk(testevent, status, secret['hdbserver'], SID, log)
+    # Flush the batch 
+    log.debug(f"flushing the batch")
     testevent.flushBatch()
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} Inserted {i} records for {SID.upper()} into Splunk")
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} Script completed in {round(time.time() - start_time,2)} seconds")
-    cursor.close()
-    conn.close()
+    log.debug(f"Inserted {i} records for {SID.upper()} into Splunk")
+    log.debug(f"Script completed in {round(time.time() - start_time,2)} seconds")
 
 if __name__ == '__main__':
     SID = os.environ['SID']
